@@ -482,8 +482,15 @@ def compute_trust_scores(client_deltas, loss_before, loss_after,
         d = client_deltas[cid]
 
         # CAS: cosine similarity with mean update (clipped to [0,1])
-        cos = F.cosine_similarity(d.unsqueeze(0), mean_delta.unsqueeze(0)).item()
-        cas = max(0.0, (cos + 1.0) / 2.0)   # map [-1,1] → [0,1]
+        # Guard: if either vector is zero, cosine_similarity returns NaN → default 0.5
+        d_norm      = d.norm().item()
+        mean_norm_v = mean_delta.norm().item()
+        if d_norm < 1e-12 or mean_norm_v < 1e-12:
+            cas = 0.5   # neutral trust for zero-update clients
+        else:
+            cos = F.cosine_similarity(d.unsqueeze(0), mean_delta.unsqueeze(0)).item()
+            cos = max(-1.0, min(1.0, cos))   # clamp to valid range (float precision)
+            cas = (cos + 1.0) / 2.0          # map [-1,1] → [0,1]
 
         # LCS: relative loss reduction
         lb, la = loss_before[cid], loss_after[cid]
@@ -494,8 +501,9 @@ def compute_trust_scores(client_deltas, loss_before, loss_after,
         ratio = norms[cid] / mean_norm
         ncs = math.exp(-max(0.0, ratio - 1.0))
 
-        # Weighted trust
+        # Weighted trust — clamp final score to [0,1]
         t = weights["cas"] * cas + weights["lcs"] * lcs + weights["ncs"] * ncs
+        t = max(0.0, min(1.0, t))
         trust_scores[cid] = t
         score_details[cid] = {"CAS": cas, "LCS": lcs, "NCS": ncs, "trust": t}
 
@@ -709,10 +717,32 @@ def has_nan(model):
 
 
 # ── STEP 11: Logging ──────────────────────────────────────────────────────────
+
+# ── Google Drive base path (set automatically in Colab, falls back to local) ──
+def get_base_dir():
+    """
+    Returns the base directory for saving ALL outputs.
+    In Colab: saves to Google Drive so nothing is lost on disconnect.
+    Locally:  saves to current directory.
+    """
+    drive_path = "/content/drive/MyDrive/TrustFed_results"
+    if os.path.exists("/content/drive/MyDrive"):
+        os.makedirs(drive_path, exist_ok=True)
+        return drive_path
+    return "."   # local fallback
+
+BASE_DIR = get_base_dir()
+
+
 def ensure_dirs(tag):
-    os.makedirs(f"results/{tag}", exist_ok=True)
+    ckpt = os.path.join(BASE_DIR, "checkpoints", tag)
+    res  = os.path.join(BASE_DIR, "results",     tag)
+    os.makedirs(ckpt, exist_ok=True)
+    os.makedirs(res,  exist_ok=True)
+    # Keep local symlinks so plot functions that use "results/" still work
+    os.makedirs(f"results/{tag}",     exist_ok=True)
     os.makedirs(f"checkpoints/{tag}", exist_ok=True)
-    return f"checkpoints/{tag}", f"results/{tag}"
+    return ckpt, res
 
 
 def init_csv(path):
@@ -741,11 +771,48 @@ def log_csv(path, rnd, acc, loss, asr, precision, recall, f1,
         )
 
 
-def save_checkpoint(model, rnd, acc, tag):
-    path = f"checkpoints/{tag}/round_{rnd}.pt"
-    torch.save({"round": rnd, "acc": acc,
-                "state_dict": model.state_dict()}, path)
-    return path
+def save_checkpoint(model, rnd, acc, tag, is_best=False):
+    """
+    Saves TWO checkpoints every call:
+      1. checkpoints/{tag}/latest.pt   — always overwritten (resume point)
+      2. checkpoints/{tag}/best.pt     — only when is_best=True
+    Also saves a per-round copy every CKPT_EVERY_N rounds for safety.
+    All saved to Google Drive (BASE_DIR) so nothing is lost on Colab disconnect.
+    """
+    ckpt_dir = os.path.join(BASE_DIR, "checkpoints", tag)
+    os.makedirs(ckpt_dir, exist_ok=True)
+
+    payload = {"round": rnd, "acc": acc, "state_dict": model.state_dict()}
+
+    # Always save latest (resume point — overwrite each round)
+    latest_path = os.path.join(ckpt_dir, "latest.pt")
+    torch.save(payload, latest_path)
+
+    # Save best separately
+    if is_best:
+        torch.save(payload, os.path.join(ckpt_dir, "best.pt"))
+
+    # Save a permanent snapshot every 10 rounds
+    if rnd % 10 == 0:
+        torch.save(payload, os.path.join(ckpt_dir, f"round_{rnd}.pt"))
+
+    return latest_path
+
+
+def load_checkpoint(tag):
+    """
+    Load latest checkpoint for a given tag (for resuming).
+    Returns (full_ckpt_dict, start_round) or (None, 1) if no checkpoint.
+    start_round = last completed round + 1 (so we don't repeat a round).
+    """
+    latest_path = os.path.join(BASE_DIR, "checkpoints", tag, "latest.pt")
+    if os.path.exists(latest_path):
+        ckpt = torch.load(latest_path, map_location=DEVICE)
+        resume_from = ckpt["round"] + 1   # +1: that round is already done
+        print(f"  [RESUME] Round {ckpt['round']} already done "
+              f"(acc={ckpt['acc']:.2f}%). Resuming from round {resume_from}.")
+        return ckpt, resume_from
+    return None, 1
 
 
 # ── STEP 12: Single Experiment ────────────────────────────────────────────────
@@ -759,16 +826,27 @@ def run_experiment(method, attack_type, train_ds, test_ds, root_ds,
     set_seed(seed)
     tag = f"{method}_{attack_type}_s{seed}"
     ckpt_dir, res_dir = ensure_dirs(tag)
-    csv_path = init_csv(f"{res_dir}/log.csv")
+
+    global_model = make_model()
+    best_acc     = 0.0
+    prev_state   = None
+
+    # ── Resume from checkpoint if one exists ──────────────────────────────────
+    ckpt, start_round = load_checkpoint(tag)
+    if ckpt is not None:
+        global_model.load_state_dict(ckpt["state_dict"])
+        best_acc = ckpt.get("acc", 0.0)   # restore best_acc correctly
+
+    # Only create (wipe) the CSV log if starting fresh — otherwise append
+    csv_path = os.path.join(res_dir, "log.csv")
+    if start_round == 1:
+        csv_path = init_csv(csv_path)   # fresh start: write header
+    # If resuming, CSV already exists with previous rounds — just append to it
 
     client_loaders = create_client_loaders(train_ds, client_indices)
     root_loader    = DataLoader(root_ds, batch_size=64, shuffle=True)
     test_loader    = DataLoader(test_ds, batch_size=256, shuffle=False)
     data_sizes     = [len(client_indices[cid]) for cid in range(NUM_CLIENTS)]
-
-    global_model = make_model()
-    best_acc     = 0.0
-    prev_state   = None
 
     rep_tracker  = ReputationTracker(NUM_CLIENTS)
     adapt_wt     = AdaptiveWeightTracker()
@@ -796,7 +874,7 @@ def run_experiment(method, attack_type, train_ds, test_ds, root_ds,
     # Build triggered test loader once (for ASR evaluation every round)
     triggered_loader = make_triggered_test_loader(test_ds)
 
-    for rnd in range(1, NUM_ROUNDS + 1):
+    for rnd in range(start_round, NUM_ROUNDS + 1):
         prev_state = copy.deepcopy(global_model.state_dict())
 
         client_states   = []
@@ -866,9 +944,11 @@ def run_experiment(method, attack_type, train_ds, test_ds, root_ds,
 
         acc, loss = evaluate(global_model, test_loader)
 
-        if acc > best_acc:
+        is_best = acc > best_acc
+        if is_best:
             best_acc = acc
-            save_checkpoint(global_model, rnd, acc, tag)
+        # Save every round: latest.pt (resume) + best.pt + round_N.pt every 10
+        save_checkpoint(global_model, rnd, acc, tag, is_best=is_best)
 
         # ── NEW v5: Backdoor ASR ──────────────────────────────────────────────
         asr = evaluate_backdoor_asr(global_model, triggered_loader)
