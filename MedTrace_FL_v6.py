@@ -731,18 +731,29 @@ def get_base_dir():
         return drive_path
     return "."   # local fallback
 
-BASE_DIR = get_base_dir()
+# BASE_DIR is re-evaluated each call so it picks up Drive even if mounted late
+def get_drive_dir():
+    drive_path = "/content/drive/MyDrive/TrustFed_results"
+    if os.path.exists("/content/drive/MyDrive"):
+        os.makedirs(drive_path, exist_ok=True)
+        return drive_path
+    return None
+
+BASE_DIR = get_base_dir()   # initial value — may be "." if Drive not yet mounted
 
 
 def ensure_dirs(tag):
-    ckpt = os.path.join(BASE_DIR, "checkpoints", tag)
-    res  = os.path.join(BASE_DIR, "results",     tag)
-    os.makedirs(ckpt, exist_ok=True)
-    os.makedirs(res,  exist_ok=True)
-    # Keep local symlinks so plot functions that use "results/" still work
-    os.makedirs(f"results/{tag}",     exist_ok=True)
-    os.makedirs(f"checkpoints/{tag}", exist_ok=True)
-    return ckpt, res
+    # Always use local paths (survive KeyboardInterrupt in same session)
+    local_ckpt = f"checkpoints/{tag}"
+    local_res  = f"results/{tag}"
+    os.makedirs(local_ckpt, exist_ok=True)
+    os.makedirs(local_res,  exist_ok=True)
+    # Also mirror to Drive if mounted (survive runtime restart)
+    drive = get_drive_dir()
+    if drive:
+        os.makedirs(os.path.join(drive, "checkpoints", tag), exist_ok=True)
+        os.makedirs(os.path.join(drive, "results",     tag), exist_ok=True)
+    return local_ckpt, local_res
 
 
 def init_csv(path):
@@ -773,45 +784,48 @@ def log_csv(path, rnd, acc, loss, asr, precision, recall, f1,
 
 def save_checkpoint(model, rnd, acc, tag, is_best=False):
     """
-    Saves TWO checkpoints every call:
-      1. checkpoints/{tag}/latest.pt   — always overwritten (resume point)
-      2. checkpoints/{tag}/best.pt     — only when is_best=True
-    Also saves a per-round copy every CKPT_EVERY_N rounds for safety.
-    All saved to Google Drive (BASE_DIR) so nothing is lost on Colab disconnect.
+    Saves checkpoints to TWO places every round:
+      - LOCAL:  checkpoints/{tag}/latest.pt  (survives KeyboardInterrupt)
+      - DRIVE:  /content/drive/.../latest.pt (survives runtime restart)
+    Both are always written so resume works regardless of how training stopped.
     """
-    ckpt_dir = os.path.join(BASE_DIR, "checkpoints", tag)
-    os.makedirs(ckpt_dir, exist_ok=True)
-
     payload = {"round": rnd, "acc": acc, "state_dict": model.state_dict()}
 
-    # Always save latest (resume point — overwrite each round)
-    latest_path = os.path.join(ckpt_dir, "latest.pt")
-    torch.save(payload, latest_path)
+    def _save_to(ckpt_dir):
+        os.makedirs(ckpt_dir, exist_ok=True)
+        torch.save(payload, os.path.join(ckpt_dir, "latest.pt"))
+        if is_best:
+            torch.save(payload, os.path.join(ckpt_dir, "best.pt"))
+        if rnd % 10 == 0:
+            torch.save(payload, os.path.join(ckpt_dir, f"round_{rnd}.pt"))
 
-    # Save best separately
-    if is_best:
-        torch.save(payload, os.path.join(ckpt_dir, "best.pt"))
+    # Always save locally (fast, survives KeyboardInterrupt in same session)
+    _save_to(f"checkpoints/{tag}")
 
-    # Save a permanent snapshot every 10 rounds
-    if rnd % 10 == 0:
-        torch.save(payload, os.path.join(ckpt_dir, f"round_{rnd}.pt"))
-
-    return latest_path
+    # Also save to Drive if mounted (survives full runtime restart)
+    drive = get_drive_dir()
+    if drive:
+        _save_to(os.path.join(drive, "checkpoints", tag))
 
 
 def load_checkpoint(tag):
     """
-    Load latest checkpoint for a given tag (for resuming).
-    Returns (full_ckpt_dict, start_round) or (None, 1) if no checkpoint.
-    start_round = last completed round + 1 (so we don't repeat a round).
+    Looks for latest.pt in TWO locations (local first, then Drive).
+    Returns (full_ckpt_dict, start_round) or (None, 1) if nothing found.
     """
-    latest_path = os.path.join(BASE_DIR, "checkpoints", tag, "latest.pt")
-    if os.path.exists(latest_path):
-        ckpt = torch.load(latest_path, map_location=DEVICE)
-        resume_from = ckpt["round"] + 1   # +1: that round is already done
-        print(f"  [RESUME] Round {ckpt['round']} already done "
-              f"(acc={ckpt['acc']:.2f}%). Resuming from round {resume_from}.")
-        return ckpt, resume_from
+    search_paths = [
+        f"checkpoints/{tag}/latest.pt",                               # local (same session)
+        f"/content/drive/MyDrive/TrustFed_results/checkpoints/{tag}/latest.pt",  # Drive (new session)
+    ]
+    for path in search_paths:
+        if os.path.exists(path):
+            ckpt = torch.load(path, map_location=DEVICE)
+            resume_from = ckpt["round"] + 1
+            print(f"  [RESUME] Found checkpoint at: {path}")
+            print(f"  [RESUME] Round {ckpt['round']} done (acc={ckpt['acc']:.2f}%). "
+                  f"Starting from round {resume_from}.")
+            return ckpt, resume_from
+    print(f"  [FRESH]  No checkpoint found for tag='{tag}'. Starting from round 1.")
     return None, 1
 
 
